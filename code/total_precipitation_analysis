@@ -1,0 +1,364 @@
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.patches as patches
+from minisom import MiniSom
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.decomposition import PCA
+from scipy.spatial import distance
+from scipy.ndimage import gaussian_filter
+import pandas as pd
+import seaborn as sns
+
+# --- 1. Load and Initial Preprocessing ---
+print("Loading and preprocessing data...")
+# Load dataset with Dask (lazy loading)
+ds = xr.open_dataset('1995-2019_tp.nc',  chunks={"valid_time": 500})
+
+# Select Total Precipitation and convert from meters to millimeters
+tp = ds['tp'] * 1000  # Now in mm
+# Reduce dataset size
+tp = tp.resample(valid_time='1D').mean('valid_time').compute()
+# Get coordinates
+lat = tp.latitude.values
+lon = tp.longitude.values
+
+# Convert to NumPy array
+tp_data = tp.values
+
+# Reshape data
+time_steps, lat_size, lon_size = tp_data.shape
+tp_flat = tp_data.reshape(time_steps, -1)
+
+# --- YOUR ORIGINAL DATA SCALING (REVERTED) ---
+# Normalize data while preserving actual precipitation range
+scaler = MinMaxScaler(feature_range=(tp_flat.min(), tp_flat.max())) # Reverted to your original scaler initialization
+tp_normalized = scaler.fit_transform(tp_flat)
+
+# Apply PCA to reduce dimensionality
+pca = PCA(n_components=0.95)  # Retain 95% of variance, added random_state for reproducibility
+tp_pca = pca.fit_transform(tp_normalized)
+# Define SOM grid (3x4)
+som_x, som_y = 3,4
+som = MiniSom(som_x, som_y, tp_pca.shape[1],
+              sigma=2.5, learning_rate=0.01,
+              neighborhood_function='gaussian',
+              random_seed=10)
+
+# PCA-based weight initialization
+som.pca_weights_init(tp_pca)
+# Train SOM
+som.train_random(tp_pca, 500000, verbose=True)
+# Compute errors
+q_error = np.mean([distance.euclidean(x, som.get_weights()[som.winner(x)]) for x in tp_pca])
+topo_error = np.mean([
+    1 if np.linalg.norm(np.array(som.winner(x)) - np.array(som.winner(y))) > 1 else 0
+    for x, y in zip(tp_pca[:-1], tp_pca[1:])
+])
+
+print(f'Quantization Error: {q_error:.4f}')
+print(f'Topology Error: {topo_error:.4f}')
+
+# Map samples to nodes
+mapped_nodes = np.array([som.winner(x) for x in tp_pca])
+
+# Count samples per node
+node_counts = np.zeros((som_x, som_y))
+for node_coords in mapped_nodes:
+    node_counts[node_coords[0], node_coords[1]] += 1
+
+# Calculate node frequencies
+total_samples = len(tp_pca)
+node_frequencies = (node_counts / total_samples) * 100
+
+# --- Combined Plotting (SOM maps + Heatmap) ---
+print("Generating combined visualizations...")
+
+# Create a figure with two main columns: one for SOM, one for heatmap
+fig = plt.figure(figsize=(25, 15)) # Increased figure width
+
+# Define GridSpec for the overall layout: 1 row, 2 columns
+gs_overall = fig.add_gridspec(1, 2, width_ratios=[0.7, 0.3], wspace=0.25)
+
+# GridSpec for the SOM plots (left column)
+gs_precip_sub = gs_overall[0, 0].subgridspec(som_x, som_y, hspace=0.1, wspace=0.1)
+axes_precip = np.empty((som_x, som_y), dtype=object)
+for i in range(som_x):
+    for j in range(som_y):
+        axes_precip[i, j] = fig.add_subplot(gs_precip_sub[i, j], projection=ccrs.PlateCarree())
+
+# Define colormap for precipitation
+cmap = plt.get_cmap("hsv")
+# Define normalization for precipitation colorbar (adjust max as needed for your data)
+norm = mcolors.Normalize(vmin=0, vmax=100) # You might need to adjust vmax based on your data's max precip values
+
+# --- HIGHLIGHTING SETUP ---
+# Define black box bounds for highlighting (same as the box drawn)
+lon_min_highlight, lon_max_highlight = 8, 14.5
+lat_min_highlight, lat_max_highlight = -18, -12
+# Set the highlighting threshold and condition
+# DEMONSTRATION: Highlight WET nodes (>= 50 mm/day) to ensure highlighting works.
+# CHANGE THIS BACK TO '< 2.0' IF YOU WANT DRY NODES.
+PRECIP_HIGHLIGHT_THRESHOLD = 1 # mm/day
+HIGHLIGHT_CONDITION_IS_WET = True # If True: >= Threshold. If False: < Threshold.
+
+lat_mask_highlight = (lat >= lat_min_highlight) & (lat <= lat_max_highlight)
+lon_mask_highlight = (lon >= lon_min_highlight) & (lon <= lon_max_highlight)
+lat_idx_highlight = np.where(lat_mask_highlight)[0]
+lon_idx_highlight = np.where(lon_mask_highlight)[0]
+
+# Loop over SOM grid for Precipitation plots
+for i in range(som_x):
+    for j in range(som_y):
+        ax = axes_precip[i, j]
+        node_num = i * som_y + j + 1
+
+        # Set map extent and features
+        ax.set_extent([8, 25, -20, -5], crs=ccrs.PlateCarree())
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.3, linestyle='--')
+        ax.add_feature(cfeature.OCEAN, color='lightblue', alpha=0.3)
+        ax.add_feature(cfeature.LAND, color='lightgrey')
+
+        # Get SOM weights and transform back to original space
+        som_weights_pca = som.get_weights()[i, j].reshape(-1)
+        som_weights_normalized = pca.inverse_transform(som_weights_pca.reshape(1, -1))
+
+        # Manually inverse transform by rescaling
+        # NOTE: Using tp_flat.max() and min() from the global script context
+        precip_pattern_flat = som_weights_normalized * (tp_flat.max() - tp_flat.min()) + tp_flat.min()
+        precip_pattern = precip_pattern_flat.reshape(lat_size, lon_size)
+
+        # Apply smoothing (optional but can make contours look nicer)
+        smoothed_precip = gaussian_filter(precip_pattern, sigma=0.5)
+
+        # Plot precipitation
+        cs = ax.contourf(lon, lat, smoothed_precip, cmap=cmap,
+                                 norm=norm, levels=np.linspace(0, 60, 11), # Example levels for up to 150mm
+                                 transform=ccrs.PlateCarree())
+
+        # Highlight southwestern Angola
+        red_box_map = patches.Rectangle((10, -17.5), 4, 5, linewidth=2,
+                                            edgecolor='black', facecolor='none',
+                                            zorder=4, transform=ccrs.PlateCarree())
+        ax.add_patch(red_box_map)
+
+        # --- HIGHLIGHTING LOGIC ---
+        # Calculate mean precipitation within the black box for the current node
+        precip_in_box_node = smoothed_precip[np.ix_(lat_idx_highlight, lon_idx_highlight)]
+        mean_precip_in_box = np.nanmean(precip_in_box_node)
+        
+        # Determine the highlighting condition
+        if HIGHLIGHT_CONDITION_IS_WET:
+            # Highlight if WET: mean precip >= threshold (Demonstration logic)
+            should_highlight = (mean_precip_in_box >= PRECIP_HIGHLIGHT_THRESHOLD)
+            highlight_color = 'blue' # Use blue for WET
+        else:
+            # Highlight if DRY: mean precip < threshold (Your original request logic)
+            should_highlight = (mean_precip_in_box < PRECIP_HIGHLIGHT_THRESHOLD)
+            highlight_color = 'red' # Use red for DRY
+
+        if should_highlight:
+            # Set the title with the precipitation value and highlight the border
+            ax.set_title(f"Precip: {mean_precip_in_box:.1f} mm/day", fontsize=12, color=highlight_color, loc='center', pad=5)
+            for spine in ax.spines.values():
+                spine.set_edgecolor(highlight_color)
+                spine.set_linewidth(2)  
+                spine.set_zorder(5)  
+        else:
+            # Clear title and reset borders for non-highlighted nodes
+            ax.set_title('')  
+            for spine in ax.spines.values():
+                spine.set_edgecolor('black')
+                spine.set_linewidth(0.5)
+        # --- END HIGHLIGHTING LOGIC ---
+
+        # Add node info
+        ax.text(0.05, 0.9, f"Node {node_num}", ha='left', va='top',
+                transform=ax.transAxes, fontsize=15,
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.3'))
+
+        ax.text(0.95, 0.9, f"n={int(node_counts[i, j])}\n({node_frequencies[i, j]:.1f}%)",
+                ha='right', va='top', transform=ax.transAxes,
+                fontsize=13, bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.3'))
+
+        # ----------------------------------------------------------------------
+        # NEW CODE TO ADD LATITUDE AND LONGITUDE GRIDLINES AND LABELS
+        # ----------------------------------------------------------------------
+        
+        # Add gridlines and enable labels (e.g., every 5 degrees)
+        gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
+                          linewidth=0.1, color='gray', alpha=0.5, linestyle='--',
+                          xlocs=np.arange(8, 25, 5), ylocs=np.arange(-20, -5, 5))
+        
+        # Longitude (X) labels: Only on the bottom row
+        gl.top_labels = False 
+        gl.bottom_labels = (i == som_x - 1) 
+
+        # Latitude (Y) labels: Only on the left column
+        gl.left_labels = (j == 0)
+        gl.right_labels = False 
+
+        # Style the labels
+        gl.xlabel_style = {'fontsize': 12}
+        gl.ylabel_style = {'fontsize': 12}
+        
+        # The original lines suppressing ticks are now REMOVED:
+        # ax.set_xticks([]) 
+        # ax.set_yticks([]) 
+        # ----------------------------------------------------------------------
+
+# Add a common colorbar for the Precipitation SOM plots
+precip_bbox = gs_overall[0, 0].get_position(fig)
+cbar_ax_precip = fig.add_axes([precip_bbox.x0 + precip_bbox.width + 0.01, precip_bbox.y0, 0.015, precip_bbox.height])
+cbar_precip = fig.colorbar(cs, cax=cbar_ax_precip, orientation="vertical")
+cbar_precip.set_label("Total Precipitation (mm)", fontsize=15)
+cbar_precip.ax.tick_params(labelsize=15)
+# Add label for the Precipitation plot
+fig.text(precip_bbox.x0 + precip_bbox.width / 2, 0.90, '(a)',
+          fontsize=14, ha='center', va='top')
+
+
+# --- HEATMAP SECTION: Corrected for Dual Annotation and AttributeError ---
+print("Generating heatmap (using your optimized method)...")
+
+# Define red box bounds (same as before)
+lon_min_hm, lon_max_hm = 8, 14.5
+lat_min_hm, lat_max_hm = -18, -12 # Using _hm suffix to avoid re-defining existing vars
+
+# Grid info from the loaded 'tp' xarray dataset
+# NOTE: Using global 'tp' variable defined in your initial code block
+lat_tp_hm = tp.latitude.values
+lon_tp_hm = tp.longitude.values
+lat_size_tp_hm = len(lat_tp_hm)
+lon_size_tp_hm = len(lon_tp_hm)
+
+# Time info from the loaded 'tp' xarray dataset
+times_hm = pd.to_datetime(tp['valid_time'].values)
+
+# Assign seasons (Southern Hemisphere)
+def get_season_hm(month):
+    if month in [12, 1, 2]:
+        return 'Summer (DJF)'
+    elif month in [3, 4, 5]:
+        return 'Autumn (MAM)'
+    elif month in [6, 7, 8]:
+        return 'Winter (JJA)'
+    else:
+        return 'Spring (SON)'
+
+seasons_hm = times_hm.month.map(get_season_hm)
+
+# Mask for red box (using _hm variables)
+lat_mask_hm = (lat_tp_hm >= lat_min_hm) & (lat_tp_hm <= lat_max_hm)
+lon_mask_hm = (lon_tp_hm >= lon_min_hm) & (lon_tp_hm <= lon_max_hm)
+lat_indices_hm = np.where(lat_mask_hm)[0]
+lon_indices_hm = np.where(lon_mask_hm)[0]
+
+# Compute flat indices inside red box
+box_flat_indices_hm = []
+for lat_i_hm in lat_indices_hm:
+    for lon_i_hm in lon_indices_hm:
+        box_flat_indices_hm.append(lat_i_hm * lon_size_tp_hm + lon_i_hm)
+box_flat_indices_hm = np.array(box_flat_indices_hm)
+
+# Mean precipitation inside red box per time step (using tp_flat from earlier)
+tp_flat_in_box_hm = tp_flat[:, box_flat_indices_hm]
+mean_tp_in_box_per_sample_hm = np.mean(tp_flat_in_box_hm, axis=1)
+
+# Threshold to define "significant" rainfall for the Heatmap (often a low value like 0 or 1 mm/day)
+precip_threshold = 0 # mm/day. 
+inside_box_mask_hm = mean_tp_in_box_per_sample_hm > precip_threshold
+
+# Map nodes to flat 1–12 
+mapped_nodes_flat_hm = np.array([i * som_y + j + 1 for i, j in mapped_nodes]) 
+
+# Filter for samples with rainfall in red box
+filtered_nodes_hm = mapped_nodes_flat_hm[inside_box_mask_hm]
+filtered_seasons_hm = seasons_hm[inside_box_mask_hm].values
+
+# Build frequency matrix
+unique_nodes_hm = np.arange(1, som_x * som_y + 1)
+unique_seasons_hm = ['Summer (DJF)', 'Autumn (MAM)', 'Winter (JJA)', 'Spring (SON)'] 
+freq_matrix_hm = np.zeros((len(unique_nodes_hm), len(unique_seasons_hm)))
+
+for i in range(len(unique_nodes_hm)):
+    for j in range(len(unique_seasons_hm)):
+        node = unique_nodes_hm[i]
+        season = unique_seasons_hm[j]
+        freq_matrix_hm[i, j] = np.sum((filtered_nodes_hm == node) & (filtered_seasons_hm == season))
+
+# Normalize to get percentages
+season_totals_hm = np.array([np.sum(filtered_seasons_hm == s) for s in unique_seasons_hm])
+season_totals_hm = np.where(season_totals_hm == 0, 1, season_totals_hm) 
+freq_percentage_hm = freq_matrix_hm / season_totals_hm * 100
+
+# FIX: Plot heatmap into the correct subplot of the overall GridSpec
+ax_heatmap = fig.add_subplot(gs_overall[0, 1])
+
+if not pd.DataFrame(freq_percentage_hm).empty and freq_percentage_hm.sum() > 0: 
+    plot_ax = sns.heatmap(freq_percentage_hm, annot=False, fmt=".1f", cmap='Reds',
+                          xticklabels=unique_seasons_hm, yticklabels=[f'{n}' for n in unique_nodes_hm],
+                          cbar_kws={'label': 'Frequency (%)'}, ax=ax_heatmap)
+
+    im = ax_heatmap.collections[0] 
+
+    ax_heatmap.set_xlabel('Season', fontsize=15)
+    ax_heatmap.set_ylabel('SOM Node', fontsize=15)
+    # Tick labels (SOM nodes & seasons)
+    ax_heatmap.tick_params(axis='both', labelsize=15)
+    # Rotate season (x-axis) labels to 90 degrees
+    ax_heatmap.set_xticklabels(
+        ax_heatmap.get_xticklabels(),
+        rotation=90,
+        ha='center'
+    )
+else:
+    ax_heatmap.text(0.5, 0.5, f"No Precipitation SOM nodes showed mean precipitation > {precip_threshold:.1f}mm/day in the box for heatmap.\nAdjust 'precip_threshold' if needed.",
+                     horizontalalignment='center', verticalalignment='center', transform=ax_heatmap.transAxes, fontsize=10)
+    ax_heatmap.set_xticks([])
+    ax_heatmap.set_yticks([])
+    ax_heatmap.set_frame_on(False) 
+    im = None 
+
+# ----------------------------------------------------------------------
+# Custom loop to add DUAL annotation (Percentage + Days)
+# ----------------------------------------------------------------------
+if im is not None:
+    for i in range(freq_percentage_hm.shape[0]):
+        for j in range(freq_percentage_hm.shape[1]):
+            frequency = freq_percentage_hm[i, j]
+            days = int(freq_matrix_hm[i, j])
+            
+            cmap_norm = mcolors.Normalize(vmin=im.norm.vmin, vmax=im.norm.vmax)
+            cell_color = im.cmap(cmap_norm(frequency))
+            luminance = 0.299*cell_color[0] + 0.587*cell_color[1] + 0.114*cell_color[2]
+            text_color = 'white' if luminance < 0.5 else 'black'
+            
+            text_label = f"{frequency:.1f}%\n(n={days})"
+            
+            ax_heatmap.text(j + 0.5, i + 0.5, text_label, 
+                              ha='center', va='center', 
+                              color=text_color, fontsize=15.7, 
+                              linespacing=1.2)
+
+    cbar_heatmap = ax_heatmap.collections[0].colorbar
+    cbar_heatmap.set_label('Frequency (%)', fontsize=15)
+    cbar_heatmap.ax.tick_params(labelsize=15)
+
+# Add label for the heatmap
+heatmap_bbox = gs_overall[0, 1].get_position(fig)
+fig.text(heatmap_bbox.x0 + heatmap_bbox.width / 2, 0.90, '(b)', fontsize=14, ha='center', va='top')
+
+# Use tight_layout only on the overall GridSpec to respect its spacing
+fig.tight_layout(rect=[0, 0, 1, 0.95]) 
+
+# --- IMPORTANT CHANGE FOR HIGH QUALITY EXPORT ---
+output_filename = 'Precipitation_SOM_Combined_HighQuality.png' 
+plt.savefig(output_filename, dpi=600, bbox_inches='tight', format='png') 
+
+plt.show() 
+print(f"Plot saved to {output_filename}")
