@@ -1,0 +1,352 @@
+import xarray as xr
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.patches as patches
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+from minisom import MiniSom
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.decomposition import PCA
+from scipy.spatial import distance # Assuming distance.euclidean is defined
+from scipy.ndimage import gaussian_filter # Not used here, but common in SOM code
+
+# Load 10m wind dataset with Dask (lazy loading)
+ds_wind = xr.open_dataset('1995-2019_10m_u_v_component_of_wind.nc').chunk({"valid_time": 500})
+
+# Select 10m u-component and v-component of wind data
+u10 = ds_wind['u10']
+v10 = ds_wind['v10']
+
+# Reduce dataset size for faster processing
+u10 = u10.resample(valid_time='1D').max()
+v10 = v10.resample(valid_time='1D').max()
+
+# Convert to NumPy arrays
+u10_data = u10.values
+v10_data = v10.values
+lat = u10.latitude.values # Latitude and longitude are the same for u10/v10
+lon = u10.longitude.values
+
+# Reshape data into 2D format (flattening latitude and longitude)
+time_steps, lat_size, lon_size = u10_data.shape
+wind_flat = np.hstack([u10_data.reshape(time_steps, -1), v10_data.reshape(time_steps, -1)])
+
+# Normalize wind data using MinMaxScaler
+scaler = MinMaxScaler()
+wind_data_normalized = scaler.fit_transform(wind_flat)
+
+# Define SOM grid (3x4) based on sensitivity tests
+som_x, som_y = 3, 4
+
+# PCA for SOM initialization (only for wind data)
+pca = PCA(n_components=0.95)  # Retain 95% of variance
+pca.fit(wind_data_normalized)
+wind_pca = pca.transform(wind_data_normalized)
+init_weights = pca.inverse_transform(wind_pca[:som_x*som_y])
+
+# Initialize and train SOM
+som = MiniSom(som_x, som_y, wind_data_normalized.shape[1], sigma=2.5, learning_rate=0.01,
+              neighborhood_function='gaussian', random_seed=10)
+som.weights = init_weights.reshape(som_x, som_y, -1)
+som.train_random(wind_data_normalized, 250000)
+# Compute Quantization and Topographic Errors (specific to wind data)
+q_error = np.mean([distance.euclidean(x, som.get_weights()[som.winner(x)]) for x in wind_data_normalized])
+topo_error = np.mean([
+    1 if np.linalg.norm(np.array(som.winner(x)) - np.array(som.winner(y))) > 1 else 0
+    for x, y in zip(wind_data_normalized[:-1], wind_data_normalized[1:])
+])
+print(f'Wind Quantization Error: {q_error:.4f}')
+print(f'Wind Topographic Error: {topo_error:.4f}')
+
+# Map samples to nodes and count frequencies
+mapped_nodes = np.array([som.winner(x) for x in wind_data_normalized])
+node_counts = np.zeros((som_x, som_y))
+for node in mapped_nodes:
+    node_counts[node[0], node[1]] += 1
+
+# Calculate node frequencies
+total_samples = len(wind_data_normalized)
+node_frequencies = (node_counts / total_samples) * 100
+
+# --- Combined Plotting ---
+
+# Create a figure with two main columns: one for SOM, one for heatmap
+fig = plt.figure(figsize=(25, 15)) # Increased figure width
+
+# Define GridSpec for the overall layout: 1 row, 2 columns
+# Increased width_ratios for the SOM part, and more wspace
+gs_overall = fig.add_gridspec(1, 2, width_ratios=[0.7, 0.3], wspace=0.25)
+
+# GridSpec for the SOM plots (left column)
+gs_som_sub = gs_overall[0, 0].subgridspec(som_x, som_y, hspace=0.1, wspace=0.1)
+axes_som = np.empty((som_x, som_y), dtype=object)
+for i in range(som_x):
+    for j in range(som_y):
+        axes_som[i, j] = fig.add_subplot(gs_som_sub[i, j], projection=ccrs.PlateCarree())
+
+# Define normalization for wind data
+norm_wind = mcolors.Normalize(vmin=min(np.min(u10_data), np.min(v10_data)),
+                             vmax=max(np.max(u10_data), np.max(v10_data)))
+quiver_spacing = 8
+
+# Define red box bounds based on the patches.Rectangle in the loop: (10, -17.5) to (14, -12.5)
+# This box defines the area of interest for the wind speed threshold check.
+lon_min_highlight, lon_max_highlight = 8, 14.5
+lat_min_highlight, lat_max_highlight = -18, -12
+
+# Create boolean mask for lat/lon indices in red box for highlighting
+lat_mask_highlight = (lat >= lat_min_highlight) & (lat <= lat_max_highlight)
+lon_mask_highlight = (lon >= lon_min_highlight) & (lon <= lon_max_highlight)
+lat_idx_highlight = np.where(lat_mask_highlight)[0]
+lon_idx_highlight = np.where(lon_mask_highlight)[0]
+
+
+# Loop over SOM grid for wind plots
+for i in range(som_x):
+    for j in range(som_y):
+        ax = axes_som[i, j]
+        node_num = i * som_y + j + 1  # Linear numbering from 1-12
+
+        # Set map extent and features
+        ax.set_extent([0, 28, -27, -5], crs=ccrs.PlateCarree())
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.3, linestyle='--')
+
+        # Get and transform SOM weights
+        som_weights = som.get_weights()[i, j].reshape(-1)
+        som_weights_transformed = scaler.inverse_transform(som_weights.reshape(1, -1))
+
+        # Extract variables (u and v components)
+        som_weights_u = som_weights_transformed[:, :lat_size * lon_size].reshape(lat_size, lon_size)
+        som_weights_v = som_weights_transformed[:, lat_size * lon_size:].reshape(lat_size, lon_size)
+        wind_speed = np.sqrt(som_weights_u**2 + som_weights_v**2)
+
+        # Plot wind speed
+        cs_wind = ax.contourf(
+            lon, lat, wind_speed,
+            cmap='jet',              # rainbow-style colormap
+            levels=np.arange(0, 13, 1),  # match your scale (1–11)
+            transform=ccrs.PlateCarree()
+        )
+
+        # Add wind arrows
+        ax.quiver(lon[::quiver_spacing], lat[::quiver_spacing],
+                  som_weights_u[::quiver_spacing, ::quiver_spacing],
+                  som_weights_v[::quiver_spacing, ::quiver_spacing],
+                  transform=ccrs.PlateCarree(), color='black',
+                  scale=40, width=0.0025)
+
+        # Add red box for southwestern Angola
+        red_box = patches.Rectangle((10, -17.5), 4, 5,
+                                    linewidth=2, edgecolor='black',
+                                    facecolor='none', zorder=4,
+                                    transform=ccrs.PlateCarree())
+        ax.add_patch(red_box)
+
+        # --- HIGHLIGHTING LOGIC WITH TITLE MODIFICATION ---
+        # Calculate mean wind speed within the red box for the current node
+        u_box_node = som_weights_u[np.ix_(lat_idx_highlight, lon_idx_highlight)]
+        v_box_node = som_weights_v[np.ix_(lat_idx_highlight, lon_idx_highlight)]
+        speed_box_node = np.sqrt(u_box_node**2 + v_box_node**2)
+        mean_speed_in_box = np.nanmean(speed_box_node) 
+
+        # Check if mean speed exceeds 5 m/s
+        if mean_speed_in_box > 4.0:
+            # Set the title with the wind speed and highlight the border
+            ax.set_title(f"Wind: {mean_speed_in_box:.1f} m/s", fontsize=12, color='red', loc='center', pad=5) # Adjusted fontsize and loc
+            for spine in ax.spines.values():
+                spine.set_edgecolor('red')
+                spine.set_linewidth(2)  
+                spine.set_zorder(5)  
+        else:
+            # Clear title and reset borders for non-highlighted nodes
+            ax.set_title('') # Ensure no title for non-highlighted nodes
+            for spine in ax.spines.values():
+                spine.set_edgecolor('black')
+                spine.set_linewidth(0.5) 
+        # --- END HIGHLIGHTING LOGIC ---
+
+        # Add node information
+        ax.text(0.05, 0.9, f"Node {node_num}", ha='left', va='top',
+                 transform=ax.transAxes, fontsize=15,
+                 bbox=dict(facecolor='white', alpha=0.7))
+
+        ax.text(0.9, 0.9, f"n={int(node_counts[i, j])}\n({node_frequencies[i, j]:.1f}%)",
+                 ha='right', va='top', transform=ax.transAxes,
+                 fontsize=13, bbox=dict(facecolor='white', alpha=0.5))
+        
+        gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
+                              linewidth=0.1, color='gray', alpha=0.5, linestyle='--',
+                              xlocs=np.arange(8, 25, 5), ylocs=np.arange(-20, -5, 5))
+        
+        # Longitude (X) labels: Only on the bottom row
+        gl.top_labels = False 
+        gl.bottom_labels = (i == som_x - 1) 
+
+        # Latitude (Y) labels: Only on the left column
+        gl.left_labels = (j == 0)
+        gl.right_labels = False 
+
+        # Style the labels
+        gl.xlabel_style = {'fontsize': 12}
+        gl.ylabel_style = {'fontsize': 12}
+        # ax.set_xticks([])
+        # ax.set_yticks([])
+
+# Add a common colorbar for the SOM plots
+som_bbox = gs_overall[0, 0].get_position(fig)
+cbar_ax_som = fig.add_axes([som_bbox.x0 + som_bbox.width + 0.01, som_bbox.y0, 0.015, som_bbox.height])
+cbar_wind = fig.colorbar(cs_wind, cax=cbar_ax_som, orientation="vertical")
+cbar_wind.set_label("Wind Speed (m/s)", fontsize=15)
+cbar_wind.set_ticks(range(0, 13))  # labels 1–11
+cbar_wind.ax.tick_params(labelsize=15)
+# Add label for the SOM plot
+fig.text(som_bbox.x0 + som_bbox.width / 2, 0.88, '(a)',
+          fontsize=14, ha='center', va='top')
+
+# --- Prepare data for Heatmap (from your original script) ---
+# Convert time index
+times = pd.to_datetime(u10['valid_time'].values)
+assert len(times) == len(mapped_nodes)
+
+# Define red box bounds
+lon_min, lon_max = 8, 14.5
+lat_min, lat_max = -18, -12
+
+# Create boolean mask for lat/lon indices in red box
+lat_mask = (lat >= lat_min) & (lat <= lat_max) 
+lon_mask = (lon >= lon_min) & (lon <= lon_max)
+lat_idx = np.where(lat_mask)[0]
+lon_idx = np.where(lon_mask)[0]
+
+# Check SOM weight vector shape
+weights_shape = som.get_weights().shape
+expected_vector_len = 2 * lat_size * lon_size
+assert weights_shape[2] == expected_vector_len, "Mismatch in SOM vector length and expected size."
+
+# Define function for Southern Hemisphere seasons
+def get_season(month):
+    if month in [12, 1, 2]:
+        return "Summer (DJF)"
+    elif month in [3, 4, 5]:
+        return "Autumn (MAM)"
+    elif month in [6, 7, 8]:
+        return "Winter (JJA)"
+    elif month in [9, 10, 11]:
+        return "Spring (SON)"
+
+seasons = [get_season(t.month) for t in times]
+
+# Determine if sample is influenced by wind in the red box
+in_box_flags = []
+for idx, node in enumerate(mapped_nodes):
+    i, j = node
+    weights = som.get_weights()[i, j].reshape(-1)
+    weights_trans = scaler.inverse_transform(weights.reshape(1, -1))
+
+    u_node = weights_trans[:, :lat_size * lon_size].reshape(lat_size, lon_size)
+    v_node = weights_trans[:, lat_size * lon_size:2 * lat_size * lon_size].reshape(lat_size, lon_size)
+
+    u_box = u_node[np.ix_(lat_idx, lon_idx)]
+    v_box = v_node[np.ix_(lat_idx, lon_idx)]
+    speed_box = np.sqrt(u_box**2 + v_box**2)
+
+    if np.nanmean(speed_box) > 0: 
+        in_box_flags.append(True)
+    else:
+        in_box_flags.append(False)
+
+# Create DataFrame
+df_heat = pd.DataFrame({
+    'time': times,
+    'season': seasons,
+    'node': [i * som_y + j + 1 for i, j in mapped_nodes],
+    'in_box': in_box_flags
+})
+
+# Filter to wind-active samples
+df_heat = df_heat[df_heat['in_box']]
+print("Number of cases exceeding wind threshold for heatmap:", len(df_heat))
+
+# Group and compute absolute count
+pivot_count = df_heat.pivot_table(index='node', columns='season', aggfunc='size', fill_value=0)
+
+# Normalize within season to percent (as before)
+pivot_percent = pivot_count.divide(pivot_count.sum(axis=0), axis=1) * 100
+
+# Sort nodes numerically and flip so Node 1 is at bottom
+pivot_count = pivot_count.sort_index(ascending=False)
+pivot_percent = pivot_percent.sort_index(ascending=False)
+
+# Rename columns with seasonal order
+season_order = ['Summer (DJF)', 'Autumn (MAM)', 'Winter (JJA)', 'Spring (SON)']
+pivot_count = pivot_count.reindex(columns=season_order)
+pivot_percent = pivot_percent.reindex(columns=season_order)
+
+# Rename index to "Node X" -> Change to just numbers
+node_indices = [str(i) for i in pivot_percent.index] # Convert to string for display
+pivot_percent.index = node_indices
+pivot_count.index = node_indices
+
+# --- NEW: Create Annotation Table ---
+# Combine percentage and count into a single annotation string
+annot_table = pivot_percent.apply(
+    lambda x: [f"{p:.1f}%\n(n={c})" for p, c in zip(x, pivot_count.loc[x.name])], 
+    axis=1, 
+    result_type='expand'
+)
+annot_table.columns = pivot_percent.columns
+
+
+# GridSpec for the Heatmap (right column)
+ax_heatmap = fig.add_subplot(gs_overall[0, 1])
+
+if not pivot_percent.empty:
+    # Use the percentage table for color mapping, but the custom table for annotations
+    # --- FONTSIZE INCREASE IS APPLIED HERE ---
+    sns.heatmap(pivot_percent, annot=annot_table, fmt="", cmap='YlGnBu',
+                cbar_kws={'label': '% Frequency'}, ax=ax_heatmap,
+                annot_kws={"fontsize": 15.7}) # <--- Increased fontsize for annotations
+
+    ax_heatmap.set_xlabel('Season', fontsize=15)
+    ax_heatmap.set_ylabel('SOM Node', fontsize=15) # Label changed, but ticks will be numbers
+     # Tick labels (SOM nodes & seasons)
+    ax_heatmap.tick_params(axis='both', labelsize=15)
+    # Rotate season (x-axis) labels to 90 degrees
+    ax_heatmap.set_xticklabels(
+        ax_heatmap.get_xticklabels(),
+        rotation=90,
+        ha='center'
+    )
+    # Colorbar (legend)
+    cbar = ax_heatmap.collections[0].colorbar
+    cbar.set_label('% Frequency', fontsize=15)
+    cbar.ax.tick_params(labelsize=15)
+else:
+    ax_heatmap.text(0.5, 0.5, "No SOM nodes exceeded the 2 m/s wind threshold.\nHeatmap not generated.",
+                     horizontalalignment='center', verticalalignment='center', transform=ax_heatmap.transAxes, fontsize=12)
+    ax_heatmap.set_xticks([])
+    ax_heatmap.set_yticks([])
+    ax_heatmap.set_frame_on(False) # Hide axes frame if no heatmap is drawn
+
+# Add label for the heatmap
+heatmap_bbox = gs_overall[0, 1].get_position(fig)
+fig.text(heatmap_bbox.x0 + heatmap_bbox.width / 2, 0.92, '(b)', fontsize=14, ha='center', va='top')
+
+# Use tight_layout only on the overall GridSpec to respect its spacing
+fig.tight_layout(rect=[0, 0, 1, 0.95]) # Adjust rect to prevent title overlap, applied to whole figure
+
+# --- IMPORTANT CHANGE FOR HIGH QUALITY EXPORT ---
+# Instead of plt.show(), save the figure
+output_filename = 'Wind_SOM_Combined_HighQual.png' # You can change the name and extension
+plt.savefig(output_filename, dpi=300, bbox_inches='tight', format='png') # Higher DPI for raster elements if any
+
+plt.show() # You can still call plt.show() if you want to see it in Colab too.
+print(f"Plot saved to {output_filename}")
+
+plt.show() # You can still call plt.show() if you want to see it in Colab too.
+print(f"Plot saved to {output_filename}")
