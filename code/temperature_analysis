@@ -1,0 +1,260 @@
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.patches as patches
+from minisom import MiniSom
+from sklearn.preprocessing import MinMaxScaler # Only MinMaxScaler is imported
+from sklearn.decomposition import PCA
+from scipy.spatial import distance
+from scipy.ndimage import gaussian_filter
+import pandas as pd
+import seaborn as sns
+
+# --- 1. Load and Initial Preprocessing ---
+print("Loading and preprocessing data...")
+ds = xr.open_dataset('1995-2019_2m_temperature.nc', chunks={"valid_time": 500})
+t2m = ds['t2m'] - 273.15
+
+t2m = t2m.resample(valid_time='1D').mean()
+lat = t2m.latitude.values
+lon = t2m.longitude.values
+
+t2m_data_np = t2m.values
+time_steps, lat_size, lon_size = t2m_data_np.shape
+t2m_flat = t2m_data_np.reshape(time_steps, -1)
+# --- 2. Data Scaling for PCA and Inverse Transformation ---
+print("Scaling data for PCA using MinMaxScaler with original data's min/max range...")
+
+# Use MinMaxScaler to scale data back to its original min/max range
+# This scaler will be used for both forward scaling and inverse transformation later.
+temp_range_scaler = MinMaxScaler(feature_range=(t2m_flat.min(), t2m_flat.max()))
+t2m_scaled_for_pca = temp_range_scaler.fit_transform(t2m_flat)
+
+# No StandardScaler here, as per your explicit instruction.
+
+# --- 3. Apply PCA for Dimensionality Reduction ---
+print("Applying PCA...")
+pca = PCA(n_components=0.95) # Retain 95% of variance
+t2m_pca = pca.fit_transform(t2m_scaled_for_pca)
+
+print(f"Original dimensions per time step: {t2m_flat.shape[1]}")
+print(f"Reduced dimensions per time step (after PCA): {t2m_pca.shape[1]}")
+
+# --- 4. Define and Train SOM ---
+print("Initializing and training SOM...")
+som_x, som_y = 3, 4
+som_input_dim = t2m_pca.shape[1]
+
+som = MiniSom(som_x, som_y, som_input_dim,
+              sigma=1.5,
+              learning_rate=0.5,
+              neighborhood_function='gaussian',
+              random_seed=10)
+
+som.pca_weights_init(t2m_pca)
+som.train_random(t2m_pca, 100000, verbose=True)
+# --- 5. Compute SOM Errors ---
+print("Calculating SOM errors...")
+q_error = np.mean([distance.euclidean(x, som.get_weights()[som.winner(x)]) for x in t2m_pca])
+topo_error = np.mean([
+    1 if np.linalg.norm(np.array(som.winner(t2m_pca[k])) - np.array(som.winner(t2m_pca[k+1]))) > 1 else 0
+    for k in range(len(t2m_pca) - 1)
+])
+
+print(f'Quantization Error: {q_error:.4f}')
+print(f'Topology Error: {topo_error:.4f}')
+
+# --- 6. Map Samples to Nodes and Calculate Frequencies ---
+print("Mapping samples to nodes and calculating frequencies...")
+mapped_nodes = np.array([som.winner(x) for x in t2m_pca])
+
+node_counts = np.zeros((som_x, som_y))
+for node_coords in mapped_nodes:
+    node_counts[node_coords[0], node_coords[1]] += 1
+
+total_samples = len(t2m_pca)
+node_frequencies = (node_counts / total_samples) * 100
+# --- Combined Plotting (SOM maps + Heatmap) ---
+print("Generating combined visualizations...")
+
+fig = plt.figure(figsize=(22, 12))
+gs_overall = fig.add_gridspec(1, 2, width_ratios=[0.7, 0.3], wspace=0.25)
+
+gs_temp_sub = gs_overall[0, 0].subgridspec(som_x, som_y, hspace=0.1, wspace=0.1)
+axes_temp = np.empty((som_x, som_y), dtype=object)
+for i in range(som_x):
+    for j in range(som_y):
+        axes_temp[i, j] = fig.add_subplot(gs_temp_sub[i, j], projection=ccrs.PlateCarree())
+
+cmap = plt.get_cmap("RdYlBu_r")
+norm = mcolors.Normalize(vmin=1, vmax=28)
+
+for i in range(som_x):
+    for j in range(som_y):
+        ax = axes_temp[i, j]
+        node_num = i * som_y + j + 1
+
+        ax.set_extent([8, 25, -20, -5], crs=ccrs.PlateCarree())
+        ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+        ax.add_feature(cfeature.BORDERS, linewidth=0.3, linestyle='--')
+        ax.add_feature(cfeature.OCEAN, color='lightblue', alpha=0.3)
+        ax.add_feature(cfeature.LAND, color='lightgrey')
+
+        som_weights_pca = som.get_weights()[i, j].reshape(1, -1)
+        som_weights_original_range = pca.inverse_transform(som_weights_pca)
+        
+        # NOTE: Assuming temp_range_scaler is correctly defined and fitted earlier to t2m_normalized/t2m_flat
+        temp_pattern_flat = temp_range_scaler.inverse_transform(som_weights_original_range)
+        temp_pattern = temp_pattern_flat.reshape(lat_size, lon_size)
+        smoothed_temp = gaussian_filter(temp_pattern, sigma=1.0)
+
+        # Plot temperature
+        cs = ax.contourf(lon, lat, smoothed_temp, cmap=cmap,
+                              norm=norm, levels=np.linspace(2, 28, 14), transform=ccrs.PlateCarree())
+        red_box_map = patches.Rectangle((10, -17.5), 4, 5, linewidth=2,
+                                            edgecolor='black', facecolor='none',
+                                            zorder=4, transform=ccrs.PlateCarree())
+        ax.add_patch(red_box_map)
+
+        ax.text(0.05, 0.9, f"Node {node_num}", ha='left', va='top',
+                transform=ax.transAxes, fontsize=15,
+                bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.3'))
+
+        ax.text(0.95, 0.9, f"n={int(node_counts[i, j])}\n({node_frequencies[i, j]:.1f}%)",
+                ha='right', va='top', transform=ax.transAxes,
+                fontsize=13, bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.3'))
+        gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
+                             linewidth=0.1, color='gray', alpha=0.5, linestyle='--',
+                             xlocs=np.arange(8, 25, 5), ylocs=np.arange(-20, -5, 5))
+        
+        # Longitude (X) labels: Only on the bottom row
+        gl.top_labels = False 
+        gl.bottom_labels = (i == som_x - 1) 
+
+        # Latitude (Y) labels: Only on the left column
+        gl.left_labels = (j == 0)
+        gl.right_labels = False 
+
+        # Style the labels
+        gl.xlabel_style = {'fontsize': 12}
+        gl.ylabel_style = {'fontsize': 12}
+        # ax.set_xticks([])
+        # ax.set_yticks([])
+
+temp_bbox = gs_overall[0, 0].get_position(fig)
+cbar_ax_temp = fig.add_axes([temp_bbox.x0 + temp_bbox.width + 0.01, temp_bbox.y0, 0.015, temp_bbox.height])
+cbar_temp = fig.colorbar(cs, cax=cbar_ax_temp, orientation="vertical")
+cbar_temp.set_label("2m Temperature (°C)", fontsize=15)
+cbar_temp.set_ticks(np.arange(2, 29, 2))     # labels 1–16
+cbar_temp.ax.tick_params(labelsize=15)
+fig.text(temp_bbox.x0 + temp_bbox.width / 2, 0.90, '(a)', fontsize=14, ha='center', va='top')
+
+# --- HEATMAP SECTION ---
+print("Generating heatmap (using your optimized method)...")
+
+lon_min_hm, lon_max_hm = 8, 14.5
+lat_min_hm, lat_max_hm = -18, -12
+
+# NOTE: Assuming t2m and t2m_flat are defined globally from your initial code
+lat_t_hm = t2m.latitude.values
+lon_t_hm = t2m.longitude.values
+lat_size_t_hm = len(lat_t_hm)
+lon_size_t_hm = len(lon_t_hm)
+
+times_hm = pd.to_datetime(t2m['valid_time'].values)
+
+def get_season_hm(month):
+    if month in [12, 1, 2]: return 'Summer (DJF)'
+    elif month in [3, 4, 5]: return 'Autumn (MAM)'
+    elif month in [6, 7, 8]: return 'Winter (JJA)'
+    else: return 'Spring (SON)'
+
+seasons_hm = times_hm.month.map(get_season_hm)
+
+lat_mask_hm = (lat_t_hm >= lat_min_hm) & (lat_t_hm <= lat_max_hm)
+lon_mask_hm = (lon_t_hm >= lon_min_hm) & (lon_t_hm <= lon_max_hm)
+lat_indices_hm = np.where(lat_mask_hm)[0]
+lon_indices_hm = np.where(lon_mask_hm)[0]
+
+box_flat_indices_hm = [lat_i * lon_size_t_hm + lon_i for lat_i in lat_indices_hm for lon_i in lon_indices_hm]
+t2m_flat_in_box_hm = t2m_flat[:, box_flat_indices_hm]
+mean_temp_in_box_per_sample_hm = np.mean(t2m_flat_in_box_hm, axis=1)
+
+threshold_temp = 0
+inside_box_mask_hm = mean_temp_in_box_per_sample_hm > threshold_temp
+
+mapped_nodes_flat_hm = np.array([i * som_y + j + 1 for i, j in mapped_nodes])
+filtered_nodes_hm = mapped_nodes_flat_hm[inside_box_mask_hm]
+filtered_seasons_hm = seasons_hm[inside_box_mask_hm].values
+
+unique_nodes_hm = np.arange(1, som_x * som_y + 1)
+unique_seasons_hm_ordered = ['Summer (DJF)', 'Autumn (MAM)', 'Winter (JJA)', 'Spring (SON)']
+freq_matrix_hm = np.zeros((len(unique_nodes_hm), len(unique_seasons_hm_ordered)))
+
+for i, node in enumerate(unique_nodes_hm):
+    for j, season in enumerate(unique_seasons_hm_ordered):
+        # freq_matrix_hm holds the count (number of days)
+        freq_matrix_hm[i, j] = np.sum((filtered_nodes_hm == node) & (filtered_seasons_hm == season))
+
+season_totals_hm = np.array([np.sum(filtered_seasons_hm == s) for s in unique_seasons_hm_ordered])
+season_totals_hm = np.where(season_totals_hm == 0, 1, season_totals_hm)
+freq_percentage_hm = freq_matrix_hm / season_totals_hm * 100
+
+ax_heatmap = fig.add_subplot(gs_overall[0, 1])
+
+if not pd.DataFrame(freq_percentage_hm).empty and freq_percentage_hm.sum() > 0:
+    # 1. Plot heatmap *without* default annotation
+    im = sns.heatmap(freq_percentage_hm, annot=False, fmt=".1f", cmap='YlOrBr',
+                    xticklabels=unique_seasons_hm_ordered, yticklabels=[f'{n}' for n in unique_nodes_hm],
+                    cbar_kws={'label': 'Frequency (%)'}, ax=ax_heatmap).collections[0]
+    
+    # 2. Loop to add custom DUAL annotation (Percentage + Days)
+    for i in range(freq_percentage_hm.shape[0]):
+        for j in range(freq_percentage_hm.shape[1]):
+            frequency = freq_percentage_hm[i, j]
+            days = int(freq_matrix_hm[i, j]) # Number of days
+            
+            # Get color for contrast determination
+            cmap_norm = mcolors.Normalize(vmin=im.norm.vmin, vmax=im.norm.vmax)
+            cell_color = im.cmap(cmap_norm(frequency))
+            luminance = 0.299*cell_color[0] + 0.587*cell_color[1] + 0.114*cell_color[2]
+            text_color = 'white' if luminance < 0.5 else 'black'
+            
+            # Format the text with both frequency (percentage) and number of days (n)
+            text_label = f"{frequency:.1f}%\n(n={days})"
+            
+            # Place the dual-line annotation
+            ax_heatmap.text(j + 0.5, i + 0.5, text_label, 
+                            ha='center', va='center', 
+                            color=text_color, fontsize=15.7, 
+                            linespacing=1.2)
+            
+    ax_heatmap.set_xlabel('Season', fontsize=15)
+    ax_heatmap.set_ylabel('SOM Node', fontsize=15)
+    ax_heatmap.tick_params(axis='both', labelsize=15)
+        # Colorbar (legend)
+    cbar = ax_heatmap.collections[0].colorbar
+    cbar.set_label('% Frequency', fontsize=15)
+    cbar.ax.tick_params(labelsize=15)
+else:
+    ax_heatmap.text(0.5, 0.5, f"No SOM nodes showed mean temperature > {threshold_temp:.1f}°C in the box for heatmap.\nAdjust 'threshold_temp' if needed.",
+                    horizontalalignment='center', verticalalignment='center', transform=ax_heatmap.transAxes, fontsize=10)
+    ax_heatmap.set_xticks([])
+    ax_heatmap.set_yticks([])
+    ax_heatmap.set_frame_on(False)
+
+# Get colorbar reference from the plotted image
+cbar_heatmap = ax_heatmap.collections[0].colorbar
+cbar_heatmap.set_label('Frequency (%)', fontsize=14)
+
+heatmap_bbox = gs_overall[0, 1].get_position(fig)
+fig.text(heatmap_bbox.x0 + heatmap_bbox.width / 2, 0.90, '(b)', fontsize=14, ha='center', va='top')
+
+fig.tight_layout(rect=[0, 0, 1, 0.95])
+output_filename = 'T2M_SOM_Combined_HighQuality_MinMaxOriginalRange_Highlighted.png'
+plt.savefig(output_filename, dpi=250, bbox_inches='tight', format='png')
+plt.show()
+print(f"Plot saved to {output_filename}")
