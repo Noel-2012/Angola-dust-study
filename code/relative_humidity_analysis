@@ -1,0 +1,297 @@
+import xarray as xr
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.patches as patches
+from minisom import MiniSom
+from sklearn.preprocessing import MinMaxScaler # Only MinMaxScaler is imported now
+from sklearn.decomposition import PCA
+from scipy.spatial import distance
+from scipy.ndimage import gaussian_filter
+import pandas as pd
+from matplotlib.colors import LinearSegmentedColormap
+import calendar
+
+# --- 0. Set up Global Parameters & Reproducibility ---
+np.random.seed(10)
+som_x_rh, som_y_rh = 3, 4
+
+# --- 1. Load and Preprocess Data ---
+print("Loading and preprocessing relative humidity data...")
+
+ds_rh = xr.open_dataset(
+    '1995-2019_Relative_humidity.nc',
+    chunks={'time': 500}
+)
+
+# Select 1000 hPa level and resample to daily mean (no spatial reduction)
+rh_1000 = ds_rh['r'].sel(pressure_level=1000)
+rh_1000_daily = rh_1000.resample(valid_time='1D').mean().compute()
+
+# Extract coordinates and flatten data
+lat_rh = rh_1000_daily.latitude.values
+lon_rh = rh_1000_daily.longitude.values
+
+rh_data_np = rh_1000_daily.values
+time_steps_rh, lat_size_rh, lon_size_rh = rh_data_np.shape
+rh_flat = rh_data_np.reshape(time_steps_rh, -1)
+
+print(f"Shape of rh_flat (time_steps, features): {rh_flat.shape}")
+print(f"Min/Max/Mean of original rh_flat: {np.min(rh_flat):.4f} / {np.max(rh_flat):.4f} / {np.mean(rh_flat):.4f} %")
+
+# --- 2. Scaling for PCA ---
+print("Scaling data for PCA using MinMaxScaler (0–100 range)...")
+
+rh_range_scaler = MinMaxScaler(feature_range=(0, 100))
+rh_scaled_for_pca = rh_range_scaler.fit_transform(rh_flat)
+
+print(f"Scaled data min/max/mean: {np.min(rh_scaled_for_pca):.4f} / {np.max(rh_scaled_for_pca):.4f} / {np.mean(rh_scaled_for_pca):.4f}")
+
+# --- 3. PCA for Dimensionality Reduction ---
+print("Applying PCA to retain 95% of variance...")
+pca_rh = PCA(n_components=0.95)
+rh_pca = pca_rh.fit_transform(rh_scaled_for_pca)
+
+print(f"Original dimensions per time step: {rh_flat.shape[1]}")
+print(f"Reduced dimensions after PCA: {rh_pca.shape[1]}")
+print(f"Number of PCA components retained: {pca_rh.n_components_}")
+print(f"Cumulative explained variance: {np.sum(pca_rh.explained_variance_ratio_):.4f}")
+
+# --- 4. Train Self-Organizing Map (SOM) ---
+print("Initializing and training SOM...")
+som_input_dim_rh = rh_pca.shape[1]
+
+som_rh = MiniSom(
+    som_x_rh, som_y_rh, som_input_dim_rh,
+    sigma=1.5,
+    learning_rate=0.01,
+    neighborhood_function='gaussian',
+    random_seed=10
+)
+
+som_rh.pca_weights_init(rh_pca)
+som_rh.train_random(rh_pca, 750000, verbose=True)
+
+print("✅ SOM training for relative humidity complete.")
+
+# --- 5. Compute SOM Errors for Relative Humidity ---
+print("\n--- Section 5: Calculating SOM Errors for Relative Humidity ---")
+q_error_rh = np.mean([distance.euclidean(x, som_rh.get_weights()[som_rh.winner(x)]) for x in rh_pca])
+topo_error_rh = np.mean([
+    1 if np.linalg.norm(np.array(som_rh.winner(rh_pca[k])) - np.array(som_rh.winner(rh_pca[k+1]))) > 1 else 0
+    for k in range(len(rh_pca) - 1)
+])
+
+print(f'Quantization Error (Relative Humidity): {q_error_rh:.4f}')
+print(f'Topology Error (Relative Humidity): {topo_error_rh:.4f}')
+
+
+# --- 6. Map Samples to Nodes and Calculate Frequencies for Relative Humidity ---
+print("\n--- Section 6: Mapping Samples to Nodes and Calculating Frequencies ---")
+mapped_nodes_coords_rh = np.array([som_rh.winner(x) for x in rh_pca])
+mapped_nodes_flat_rh = [node_coords[0] * som_y_rh + node_coords[1] + 1 for node_coords in mapped_nodes_coords_rh]
+
+node_counts_rh = np.zeros((som_x_rh, som_y_rh))
+for node_coords in mapped_nodes_coords_rh:
+    node_counts_rh[node_coords[0], node_coords[1]] += 1
+
+total_samples_rh = len(rh_pca)
+node_frequencies_rh = (node_counts_rh / total_samples_rh) * 100
+
+
+# --- 7. Combined Visualization (SOM maps + Heatmap) ---
+print("\n--- Section 7: Generating Combined Visualizations for Relative Humidity ---")
+
+fig = plt.figure(figsize=(25, 15))
+gs_overall = fig.add_gridspec(1, 2, width_ratios=[0.7, 0.3], wspace=0.25)
+
+# --- Left Panel: SOM Maps (a) ---
+gs_rh_sub = gs_overall[0, 0].subgridspec(som_x_rh, som_y_rh, hspace=0.1, wspace=0.1)
+axes_rh = np.empty((som_x_rh, som_y_rh), dtype=object)
+for i in range(som_x_rh):
+    for j in range(som_y_rh):
+        axes_rh[i, j] = fig.add_subplot(gs_rh_sub[i, j], projection=ccrs.PlateCarree())
+
+axes_rh_flat = axes_rh.flatten()
+
+cmap_rh = plt.get_cmap("gist_rainbow")
+norm_rh = mcolors.Normalize(vmin=0, vmax=100)
+
+node_info_rh = {}
+
+for idx, ax in enumerate(axes_rh_flat):
+    i = idx // som_y_rh
+    j = idx % som_y_rh
+    node_num = i * som_y_rh + j + 1
+
+    ax.set_extent([8, 25, -20, -5], crs=ccrs.PlateCarree())
+    ax.add_feature(cfeature.COASTLINE, linewidth=0.5)
+    ax.add_feature(cfeature.BORDERS, linewidth=0.3, linestyle='--')
+    ax.add_feature(cfeature.OCEAN, color='lightblue', alpha=0.3)
+    ax.add_feature(cfeature.LAND, color='lightgrey')
+
+    som_weights_pca_rh = som_rh.get_weights()[i, j]
+    # 1. Inverse transform PCA: from PCA space back to MinMaxScaler's 0-100 range
+    som_weights_original_range = pca_rh.inverse_transform(som_weights_pca_rh.reshape(1, -1))
+
+    # 2. Inverse transform MinMaxScaler (from 0-100 range) to get original RH values
+    rh_pattern_flat = np.clip(rh_range_scaler.inverse_transform(som_weights_original_range), 0, 100)
+    rh_pattern = rh_pattern_flat.reshape(lat_size_rh, lon_size_rh)
+    smoothed_rh = gaussian_filter(rh_pattern, sigma=1.0)
+
+    node_info_rh[node_num] = {
+        'rh_pattern': smoothed_rh,
+        'count': node_counts_rh[i, j],
+        'frequency': node_frequencies_rh[i, j],
+        'mean_rh': np.mean(smoothed_rh),
+        'max_rh': np.max(smoothed_rh),
+        'min_rh': np.min(smoothed_rh)
+    }
+
+    cs_rh = ax.contourf(lon_rh, lat_rh, smoothed_rh, cmap=cmap_rh,
+                        norm=norm_rh, levels=15, transform=ccrs.PlateCarree())
+
+    red_box = patches.Rectangle((10, -17.5), 4, 5, linewidth=2,
+                                edgecolor='black', facecolor='none',
+                                zorder=4, transform=ccrs.PlateCarree())
+    ax.add_patch(red_box)
+
+    ax.text(0.05, 0.9, f"Node {node_num}", ha='left', va='top',
+            transform=ax.transAxes, fontsize=16,
+            bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', boxstyle='round,pad=0.3'))
+
+    ax.text(0.95, 0.9, f"n={int(node_counts_rh[i, j])}\n({node_frequencies_rh[i, j]:.1f}%)",
+            ha='right', va='top', transform=ax.transAxes,
+            fontsize=15, bbox=dict(facecolor='white', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.3'))
+    
+    gl = ax.gridlines(crs=ccrs.PlateCarree(), draw_labels=True,
+                      linewidth=0.1, color='gray', alpha=0.5, linestyle='--',
+                      xlocs=np.arange(8, 25, 5), ylocs=np.arange(-20, -5, 5))
+        
+    # Longitude (X) labels: Only on the bottom row
+    gl.top_labels = False 
+    gl.bottom_labels = (i == som_x_rh - 1) 
+
+    # Latitude (Y) labels: Only on the left column
+    gl.left_labels = (j == 0)
+    gl.right_labels = False 
+
+    # Style the labels
+    gl.xlabel_style = {'fontsize': 12}
+    gl.ylabel_style = {'fontsize': 12}
+    # ax.set_xticks([])
+    # ax.set_yticks([])
+
+# Colorbar for SOM maps
+rh_bbox = gs_overall[0, 0].get_position(fig)
+cbar_ax_rh_main = fig.add_axes([rh_bbox.x0 + rh_bbox.width + 0.01, rh_bbox.y0, 0.015, rh_bbox.height])
+cbar_rh = fig.colorbar(cs_rh, cax=cbar_ax_rh_main, orientation="vertical")
+cbar_rh.set_label("Relative Humidity at 1000 hPa (%)", fontsize=17)
+cbar_rh.ax.tick_params(labelsize=17)
+fig.text(rh_bbox.x0 + rh_bbox.width / 2, 0.88, '(a)',
+          fontsize=14, ha='center', va='top')
+
+
+# -------------------------------------------------------------
+# --- Right Panel: Seasonal Heatmap (b) ---
+# -------------------------------------------------------------
+ax_heatmap = fig.add_subplot(gs_overall[0, 1])
+
+# --- Heatmap calculations (Correctly using daily time) ---
+times_daily = rh_1000_daily.valid_time.values
+
+def get_season(month):
+    if month in [12, 1, 2]:
+        return 'Summer'
+    elif month in [3, 4, 5]:
+        return 'Autumn'
+    elif month in [6, 7, 8]:
+        return 'Winter'
+    else:
+        return 'Spring'
+
+# Define the spatial box for filtering
+lon_min, lon_max = 8, 14.5
+lat_min, lat_max = -18, -12
+
+lat_mask = (lat_rh >= lat_min) & (lat_rh <= lat_max)
+lon_mask = (lon_rh >= lon_min) & (lon_rh <= lon_max)
+
+lat_indices = np.where(lat_mask)[0]
+lon_indices = np.where(lon_mask)[0]
+
+box_flat_indices = []
+for lat_i in lat_indices:
+    for lon_i in lon_indices:
+        box_flat_indices.append(lat_i * lon_size_rh + lon_i)
+box_flat_indices = np.array(box_flat_indices)
+
+# Filter samples based on mean RH in the defined box
+threshold_rh = 0 
+rh_flat_in_box = rh_flat[:, box_flat_indices]
+mean_rh_in_box_per_sample = np.mean(rh_flat_in_box, axis=1)
+inside_box_samples_mask = mean_rh_in_box_per_sample > threshold_rh 
+
+# Convert the daily times to a pandas DatetimeIndex for month mapping
+times_pd_daily = pd.to_datetime(times_daily)
+seasons = times_pd_daily.month.map(get_season) 
+
+# Apply the sample mask to the SOM mapped nodes and the seasons array
+filtered_nodes = np.array(mapped_nodes_flat_rh)[inside_box_samples_mask]
+filtered_seasons = seasons[inside_box_samples_mask].values
+
+unique_nodes = np.arange(1, som_x_rh * som_y_rh + 1)
+unique_seasons = ['Summer', 'Autumn', 'Winter', 'Spring']
+
+freq_matrix = np.zeros((len(unique_nodes), len(unique_seasons)))
+
+for i, node in enumerate(unique_nodes):
+    for j, season in enumerate(unique_seasons):
+        freq_matrix[i, j] = np.sum((filtered_nodes == node) & (filtered_seasons == season))
+
+season_totals = np.array([np.sum(filtered_seasons == s) for s in unique_seasons])
+season_totals = np.where(season_totals == 0, 1, season_totals)
+freq_percentage = freq_matrix / season_totals * 100
+
+# --- Plotting the heatmap ---
+im = ax_heatmap.imshow(freq_percentage, aspect='auto', cmap='Blues', origin='lower')
+
+ax_heatmap.set_xticks(np.arange(len(unique_seasons)))
+season_labels = ['Summer (DJF)', 'Autumn (MAM)', 'Winter (JJA)', 'Spring (SON)']
+ax_heatmap.set_xticklabels(season_labels, fontsize=15, rotation='vertical')
+
+ax_heatmap.set_yticks(np.arange(len(unique_nodes)))
+ax_heatmap.set_yticklabels([f'{n}' for n in unique_nodes], fontsize=15)
+
+ax_heatmap.set_xlabel('Season', fontsize=15)
+ax_heatmap.set_ylabel('SOM Node', fontsize=16, labelpad=-1)
+
+# UPDATED LOOP to show both frequency % and number of days (n)
+for i in range(freq_percentage.shape[0]):
+    for j in range(freq_percentage.shape[1]):
+        frequency = freq_percentage[i, j]
+        days = int(freq_matrix[i, j])
+        
+        text_color = 'white' if frequency > freq_percentage.max() / 2 else 'black'
+        text_label = f"{frequency:.1f}%\n(n={days})"
+        
+        ax_heatmap.text(j, i, text_label, 
+                        ha='center', va='center', 
+                        color=text_color, fontsize=16, 
+                        linespacing=1.2)
+
+cbar_heatmap = plt.colorbar(im, ax=ax_heatmap)
+cbar_heatmap.set_label('Frequency (%)', fontsize=16)
+cbar_heatmap.ax.tick_params(labelsize=15)
+heatmap_bbox = gs_overall[0, 1].get_position(fig)
+fig.text(heatmap_bbox.x0 + heatmap_bbox.width / 2, 0.90, '(b)', fontsize=14, ha='center', va='top')
+
+fig.tight_layout(rect=[0, 0, 1, 0.95])
+
+output_filename_rh = 'RH_SOM_Combined.png' # Updated filename
+plt.savefig(output_filename_rh, dpi=300, bbox_inches='tight', format='png')
+plt.show()
+
+print(f"Combined Relative Humidity plot saved to {output_filename_rh}")
