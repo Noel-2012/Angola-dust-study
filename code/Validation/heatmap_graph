@@ -1,0 +1,279 @@
+import numpy as np
+import pandas as pd
+import xarray as xr
+from scipy.stats import linregress
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+
+# --- Step 1: Load and Pre-process ERA5 Data ---
+try:
+    # Rename 'valid_time' to 'time' for all datasets
+    ds_mslp = xr.open_dataset('1995-2019_Mean_sea_level_pressure.nc').chunk({"valid_time": 500})
+    mslp = ds_mslp['msl'].rename({'valid_time': 'time', 'latitude': 'lat', 'longitude': 'lon'}) / 100
+
+    ds_wind = xr.open_dataset('1995-2019_10m_u_v_component_of_wind.nc').chunk({"valid_time": 500})
+    u10 = ds_wind['u10'].rename({'valid_time': 'time', 'latitude': 'lat', 'longitude': 'lon'})
+    v10 = ds_wind['v10'].rename({'valid_time': 'time', 'latitude': 'lat', 'longitude': 'lon'})
+
+    ds_t2m = xr.open_dataset('1995-2019_2m_temperature.nc', chunks={"valid_time": 500})
+    t2m = (ds_t2m['t2m'] - 273.15).rename({'valid_time': 'time', 'latitude': 'lat', 'longitude': 'lon'})
+
+    ds_rh = xr.open_dataset('1995-2019_Relative_humidity.nc', chunks={"valid_time": 500})
+    rh = ds_rh['r'].sel(pressure_level=1000).rename({'valid_time': 'time', 'latitude': 'lat', 'longitude': 'lon'})
+
+    ds_tp = xr.open_dataset('1995-2019_tp.nc', chunks={"valid_time": 500})
+    tp = (ds_tp['tp'] * 1000).rename({'valid_time': 'time', 'latitude': 'lat', 'longitude': 'lon'})
+
+except FileNotFoundError as e:
+    print(f"Error: One of the ERA5 NetCDF files was not found. Please check your file paths: {e}")
+    # Continue to Step 2 for the purpose of demonstrating the code structure,
+    # but actual execution requires these files.
+    # For this modified code, we will assume you have the files.
+    pass 
+
+# --- Step 2: Main Validation Loop ---
+station_info = pd.DataFrame({
+    'Station': ['Iona Coastal', 'Espinheira', 'Flamingo Bay', 'Great Welwitschia', 'Namibe', 'Bentiaba', 'Mukongo', 'Capangombe', 'Munhino', 'Bibala', 'Tundavala Observatory', 'Campus ISPT', 'Humpata', 'Tchivinguiro', 'Gambos'],
+    'Period_Start': ['2017-01-15', '2015-10-20', '2017-10-13', '2015-10-26', '2014-10-30', '2014-10-27', '2014-10-26', '2014-10-22', '2016-04-23', '2014-10-21', '2015-03-19', '2014-10-17', '2014-10-17', '2015-04-02', '2014-04-11'],
+    'Period_End': ['2017-02-04', '2019-04-05', '2018-10-07', '2018-05-05', '2019-12-31', '2019-12-31', '2019-12-31', '2019-06-21', '2018-06-09', '2019-12-31', '2019-12-31', '2019-12-31', '2019-12-10', '2018-03-15', '2015-11-23'],
+    'Latitude': [-16.805617, -16.775774, -15.56784, -15.568, -15.159, -14.257, -14.749, -15.096, -14.956545, -14.808, -14.7999, -14.958, -15.069, -15.169, -15.65],
+    'Longitude': [11.88445, 12.347765, 12.02124, 12.14, 12.178, 12.387, 12.505, 13.138, 12.977325, 13.341, 13.4075, 13.445, 13.351, 13.299, 14.06667]
+})
+station_info['Period_Start'] = pd.to_datetime(station_info['Period_Start'])
+station_info['Period_End'] = pd.to_datetime(station_info['Period_End'])
+
+variables_map = {
+    't2m': 'Air temp. (avg)[°C]',
+    'mslp': 'Barom. Press. (avg)[hPa]',
+    'rh': 'Humidity (avg)[%]',
+    'tp': 'Precip. (total)[mm]',
+}
+
+# Define the variables that should use a symmetrical 5th/95th percentile filter
+SYMMETRIC_FILTER_VARS = ['Air temp. (avg)[°C]', 'Barom. Press. (avg)[hPa]', 'Humidity (avg)[%]', 'Wind speed (vc avg)[m/s]']
+# Define the variables that should use a top-end 95th percentile filter (e.g., precipitation)
+UPPER_FILTER_VARS = ['Precip. (total)[mm]']
+
+results = {'Slope': {}, 'R2': {}, 'RMSE': {}}
+
+for index, row in station_info.iterrows():
+    station_file_name = f'{row["Station"]}.xlsx'
+    if not os.path.exists(station_file_name):
+        continue
+
+    station_df = pd.read_excel(station_file_name, index_col='Date', parse_dates=True)
+    
+    # Identify wind columns for later use
+    wind_speed_col = 'Wind speed (vc avg)[m/s]'
+    wind_direction_col = 'Wind direction (vc avg)[deg.]'
+    
+    # -----------------------------------------------------------
+    # ⭐ IMPLEMENTATION OF 5TH/95TH PERCENTILE FILTERING ⭐
+    
+    # Prepare all relevant columns for filtering by coercing to numeric
+    all_station_cols = list(variables_map.values()) + [wind_speed_col, wind_direction_col]
+    
+    for col in all_station_cols:
+        if col in station_df.columns:
+            station_df[col] = pd.to_numeric(station_df[col], errors='coerce')
+            
+            # Apply Symmetrical (5th/95th) Filter
+            if col in SYMMETRIC_FILTER_VARS and station_df[col].count() > 20: # Ensure enough data for percentiles
+                lower_bound = station_df[col].quantile(0.05)
+                upper_bound = station_df[col].quantile(0.95)
+                mask = (station_df[col] < lower_bound) | (station_df[col] > upper_bound)
+                station_df.loc[mask, col] = np.nan
+            
+            # Apply Upper (95th) Filter
+            elif col in UPPER_FILTER_VARS and station_df[col].count() > 20:
+                upper_bound = station_df[col].quantile(0.95)
+                mask = station_df[col] > upper_bound
+                station_df.loc[mask, col] = np.nan
+    
+    # -----------------------------------------------------------
+    
+    # Loop for non-wind variables
+    for era5_var, station_var in variables_map.items():
+        if station_var not in station_df.columns:
+            continue
+
+        era5_var_data = locals().get(era5_var)
+        if era5_var_data is None:
+             # Skip if ERA5 data wasn't loaded due to FileNotFoundError
+             continue
+
+        era5_point_data = era5_var_data.sel(lat=row['Latitude'], lon=row['Longitude'], method='nearest')
+        era5_values = era5_point_data.sel(time=slice(pd.to_datetime('1995-01-01'), pd.to_datetime('2019-12-31')))
+
+        start_date = max(row['Period_Start'], era5_values.time.min().values)
+        end_date = min(row['Period_End'], era5_values.time.max().values)
+        
+        era5_filtered = era5_values.sel(time=slice(start_date, end_date))
+        station_filtered = station_df.loc[start_date:end_date]
+        
+        if era5_var == 'tp':
+            # Resample ERA5 data using compute() to force evaluation before pandas conversion
+            era5_filtered_daily = era5_filtered.resample(time='D').sum().compute()  
+            station_filtered_daily = station_filtered[station_var].resample('D').sum()
+        else:
+            era5_filtered_daily = era5_filtered.resample(time='D').mean().compute()
+            station_filtered_daily = station_filtered[station_var].resample('D').mean()
+
+        aligned_df = pd.DataFrame({'era5': era5_filtered_daily, 'station': station_filtered_daily}).dropna()
+        
+        if len(aligned_df) > 10:
+            era5_aligned = aligned_df['era5']
+            station_aligned = aligned_df['station']
+            
+            if len(station_aligned.unique()) < 2:
+                slope, r2, rmse = np.nan, np.nan, np.nan
+            else:
+                slope, intercept, r_value, p_value, std_err = linregress(station_aligned, era5_aligned)
+                r2 = r_value**2
+                rmse = np.sqrt(mean_squared_error(station_aligned, era5_aligned))
+            
+            if era5_var not in results['Slope']: results['Slope'][era5_var] = {}
+            if era5_var not in results['R2']: results['R2'][era5_var] = {}
+            if era5_var not in results['RMSE']: results['RMSE'][era5_var] = {}
+            
+            results['Slope'][era5_var][row['Station']] = slope
+            results['R2'][era5_var][row['Station']] = r2
+            results['RMSE'][era5_var][row['Station']] = rmse
+        else:
+            if era5_var not in results['Slope']: results['Slope'][era5_var] = {}
+            if era5_var not in results['R2']: results['R2'][era5_var] = {}
+            if era5_var not in results['RMSE']: results['RMSE'][era5_var] = {}
+            
+            results['Slope'][era5_var][row['Station']] = np.nan
+            results['R2'][era5_var][row['Station']] = np.nan
+            results['RMSE'][era5_var][row['Station']] = np.nan
+
+    # -----------------------------------------------------------
+    # New wind component validation section
+    if wind_speed_col in station_df.columns and wind_direction_col in station_df.columns:
+        
+        u10_data = locals().get('u10')
+        v10_data = locals().get('v10')
+        if u10_data is None or v10_data is None:
+            continue
+            
+        era5_point_u = u10_data.sel(lat=row['Latitude'], lon=row['Longitude'], method='nearest').sel(time=slice(pd.to_datetime('1995-01-01'), pd.to_datetime('2019-12-31')))
+        era5_point_v = v10_data.sel(lat=row['Latitude'], lon=row['Longitude'], method='nearest').sel(time=slice(pd.to_datetime('1995-01-01'), pd.to_datetime('2019-12-31')))
+
+        # Station wind speed is now potentially filtered
+        station_ws = station_df[wind_speed_col]  
+        station_wd_rad = np.deg2rad(station_df[wind_direction_col])
+        
+        # Calculate wind components from (potentially filtered) speed/direction
+        station_u = -station_ws * np.cos(station_wd_rad)
+        station_v = -station_ws * np.sin(station_wd_rad)
+
+        era5_ws = np.sqrt(era5_point_u**2 + era5_point_v**2)
+
+        wind_vars = {'u10': era5_point_u, 'v10': era5_point_v, 'wind_speed': era5_ws}
+        station_wind_vars = {'u10': station_u, 'v10': station_v, 'wind_speed': station_ws}
+
+        for var_name in wind_vars.keys():
+            era5_values = wind_vars[var_name]
+            station_values = station_wind_vars[var_name]
+
+            start_date = max(row['Period_Start'], era5_values.time.min().values)
+            end_date = min(row['Period_End'], era5_values.time.max().values)
+            
+            era5_filtered = era5_values.sel(time=slice(start_date, end_date))
+            station_filtered = station_values.loc[start_date:end_date]
+            
+            # Resample ERA5 data using compute() to force evaluation
+            era5_filtered_daily = era5_filtered.resample(time='D').mean().compute()  
+            station_filtered_daily = station_filtered.resample('D').mean()
+            
+            aligned_df = pd.DataFrame({'era5': era5_filtered_daily, 'station': station_filtered_daily}).dropna()
+            
+            if len(aligned_df) > 10:
+                era5_aligned = aligned_df['era5']
+                station_aligned = aligned_df['station']
+                
+                if len(station_aligned.unique()) < 2:
+                    slope, r2, rmse = np.nan, np.nan, np.nan
+                else:
+                    slope, intercept, r_value, p_value, std_err = linregress(station_aligned, era5_aligned)
+                    r2 = r_value**2
+                    rmse = np.sqrt(mean_squared_error(station_aligned, era5_aligned))
+
+                if var_name not in results['Slope']: results['Slope'][var_name] = {}
+                if var_name not in results['R2']: results['R2'][var_name] = {}
+                if var_name not in results['RMSE']: results['RMSE'][var_name] = {}
+                
+                results['Slope'][var_name][row['Station']] = slope
+                results['R2'][var_name][row['Station']] = r2
+                results['RMSE'][var_name][row['Station']] = rmse
+            else:
+                if var_name not in results['Slope']: results['Slope'][var_name] = {}
+                if var_name not in results['R2']: results['R2'][var_name] = {}
+                if var_name not in results['RMSE']: results['RMSE'][var_name] = {}
+                
+                results['Slope'][var_name][row['Station']] = np.nan
+                results['R2'][var_name][row['Station']] = np.nan
+                results['RMSE'][var_name][row['Station']] = np.nan
+
+# -----------------------------------------------------------
+
+# --- Step 3: Create DataFrames for Heatmaps ---
+slope_df = pd.DataFrame(results['Slope']).T
+r2_df = pd.DataFrame(results['R2']).T
+rmse_df = pd.DataFrame(results['RMSE']).T
+
+# --- Step 4: Plotting the heatmaps (MODIFIED) ---
+
+# Enlarge figure size for better visibility 
+fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(15, 18)) 
+plt.subplots_adjust(hspace=0.2) 
+
+# Plot 1: Slope
+sns.heatmap(slope_df, ax=axes[0], annot=True, fmt=".2f", cmap="viridis", cbar_kws={'label': 'Slope'}, annot_kws={"size": 14})
+axes[0].set_title('(a) Slope', fontsize=16)
+
+# Y-axis (Variables) visible
+axes[0].set_ylabel('Variables', fontsize=14)
+axes[0].set_yticklabels(slope_df.index, rotation=0, fontsize=12) # Display y-axis labels
+axes[0].tick_params(axis='y', length=3) 
+
+# X-axis (Stations) hidden
+axes[0].set_xlabel('')
+axes[0].set_xticks([]) 
+axes[0].tick_params(axis='x', length=0) 
+
+# Plot 2: R2
+sns.heatmap(r2_df, ax=axes[1], annot=True, fmt=".2f", cmap="YlGnBu", cbar_kws={'label': '$R^2$'}, annot_kws={"size": 14})
+axes[1].set_title('(b) R²', fontsize=16)
+
+# Y-axis (Variables) visible
+axes[1].set_ylabel('Variables', fontsize=14) 
+axes[1].set_yticklabels(r2_df.index, rotation=0, fontsize=12) # Display y-axis labels
+axes[1].tick_params(axis='y', length=3)
+
+# X-axis (Stations) hidden
+axes[1].set_xlabel('') 
+axes[1].set_xticks([]) 
+axes[1].tick_params(axis='x', length=0) 
+
+# Plot 3: RMSE - Stations only shown on X-axis
+sns.heatmap(rmse_df, ax=axes[2], annot=True, fmt=".2f", cmap="YlOrRd", cbar_kws={'label': 'RMSE'}, annot_kws={"size": 14})
+axes[2].set_title('(c) RMSE', fontsize=16)
+
+# Y-axis (Variables) visible
+axes[2].set_ylabel('Variables', fontsize=14) 
+axes[2].set_yticklabels(rmse_df.index, rotation=0, fontsize=12) 
+axes[2].tick_params(axis='y', length=3) 
+
+# X-axis (Stations) visible
+axes[2].set_xlabel('Stations', fontsize=14) # Set X-axis label
+axes[2].tick_params(axis='x', length=3) 
+axes[2].set_xticklabels(rmse_df.columns, rotation=45, ha="right", fontsize=12) # Display x-axis labels
+
+plt.tight_layout()
+# Save the figure to a file
+plt.savefig('heatmap_variables_on_y_stations_on_x.png', bbox_inches='tight')
+# plt.show()
