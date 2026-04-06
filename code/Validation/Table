@@ -1,0 +1,27 @@
+# --- Calculate Mean & Std Dev Across Stations for Each Variable ---
+# Create a summary DataFrame
+summary_stats = pd.DataFrame({
+    'Slope_mean': slope_df.mean(axis=1),
+    'Slope_std': slope_df.std(axis=1),
+    'R2_mean': r2_df.mean(axis=1),
+    'R2_std': r2_df.std(axis=1),
+    'RMSE_mean': rmse_df.mean(axis=1),
+    'RMSE_std': rmse_df.std(axis=1),
+    'N_stations': slope_df.count(axis=1)  # Number of valid stations
+})
+
+# Print the summary in a clean format
+print("\n=== Summary Statistics Across All Stations ===")
+print("(Mean ± Standard Deviation)")
+print("=" * 60)
+for var in summary_stats.index:
+    print(f"\nVariable: {var}")
+    print(f"  Slope: {summary_stats.loc[var, 'Slope_mean']:.3f} ± {summary_stats.loc[var, 'Slope_std']:.3f}")
+    print(f"  R²:    {summary_stats.loc[var, 'R2_mean']:.3f} ± {summary_stats.loc[var, 'R2_std']:.3f}")
+    print(f"  RMSE:  {summary_stats.loc[var, 'RMSE_mean']:.3f} ± {summary_stats.loc[var, 'RMSE_std']:.3f}")
+    print(f"  (N = {summary_stats.loc[var, 'N_stations']})")
+print("=" * 60)
+
+# Save to CSV
+summary_stats.to_csv('era5_validation_summary_statistics.csv')
+print("\nSummary statistics saved to 'era5_validation_summary_statistics.csv'")
