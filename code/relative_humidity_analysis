@@ -166,45 +166,6 @@ for i, node in enumerate(unique_nodes):
     for j, season in enumerate(unique_seasons):
         freq_matrix[i, j] = np.sum((filtered_nodes == node) & (filtered_seasons == season))
 
-season_totals = np.array([np.sum(filtered_seasons == s) for s in unique_seasons])
-season_totals = np.where(season_totals == 0, 1, season_totals)
-freq_percentage = freq_matrix / season_totals * 100
-
-# --- Plotting the heatmap ---
-im = ax_heatmap.imshow(freq_percentage, aspect='auto', cmap='Blues', origin='lower')
-
-ax_heatmap.set_xticks(np.arange(len(unique_seasons)))
-season_labels = ['Summer (DJF)', 'Autumn (MAM)', 'Winter (JJA)', 'Spring (SON)']
-ax_heatmap.set_xticklabels(season_labels, fontsize=15, rotation='vertical')
-
-ax_heatmap.set_yticks(np.arange(len(unique_nodes)))
-ax_heatmap.set_yticklabels([f'{n}' for n in unique_nodes], fontsize=15)
-
-ax_heatmap.set_xlabel('Season', fontsize=15)
-ax_heatmap.set_ylabel('SOM Node', fontsize=16, labelpad=-1)
-
-# UPDATED LOOP to show both frequency % and number of days (n)
-for i in range(freq_percentage.shape[0]):
-    for j in range(freq_percentage.shape[1]):
-        frequency = freq_percentage[i, j]
-        days = int(freq_matrix[i, j])
-        
-        text_color = 'white' if frequency > freq_percentage.max() / 2 else 'black'
-        text_label = f"{frequency:.1f}%\n(n={days})"
-        
-        ax_heatmap.text(j, i, text_label, 
-                        ha='center', va='center', 
-                        color=text_color, fontsize=16, 
-                        linespacing=1.2)
-
-cbar_heatmap = plt.colorbar(im, ax=ax_heatmap)
-cbar_heatmap.set_label('Frequency (%)', fontsize=16)
-cbar_heatmap.ax.tick_params(labelsize=15)
-heatmap_bbox = gs_overall[0, 1].get_position(fig)
-fig.text(heatmap_bbox.x0 + heatmap_bbox.width / 2, 0.90, '(b)', fontsize=14, ha='center', va='top')
-
-fig.tight_layout(rect=[0, 0, 1, 0.95])
-
 output_filename_rh = 'RH_SOM_Combined.png' # Updated filename
 plt.savefig(output_filename_rh, dpi=300, bbox_inches='tight', format='png')
 plt.show()
