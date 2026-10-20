@@ -1,1 +1,159 @@
+import xarray as xr
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.colors as mcolors
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.patches as patches
+from scipy.ndimage import gaussian_filter
+from minisom import MiniSom
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.decomposition import PCA
+from scipy.spatial import distance # Needed for error calculations
+import seaborn as sns # Keep seaborn import
+
+# --- Data Loading and SOM Training (Assumed from previous context) ---
+# NOTE: The execution environment is still failing on xarray, but 
+# the rest of the script is provided here for completeness.
+
+# Load Mean Sea Level Pressure dataset with Dask (lazy loading)
+# This section must exist before the code you provided:
+# ds = xr.open_dataset('1995-2019_Mean_sea_level_pressure.nc').chunk({"valid_time": 500})
+# mslp = ds['msl'] / 100 
+# mslp = mslp.resample(valid_time='1D').mean().compute()
+# mslp_data = mslp.values
+# lat = mslp.latitude.values
+# lon = mslp.longitude.values
+# time_steps, lat_size, lon_size = mslp_data.shape
+# mslp_flat = mslp_data.reshape(time_steps, -1)
+# scaler = MinMaxScaler()
+# mslp_data_normalized = scaler.fit_transform(mslp_flat)
+# som_x, som_y = 3, 4
+# som = MiniSom(...)
+# som.pca_weights_init(mslp_data_normalized)
+# som.train_random(mslp_data_normalized, 250000)
+
+# --- START OF CODE YOU PROVIDED ---
+# Compute Quantization and Topographic Errors (specific to MSLP data)
+q_error = np.mean([distance.euclidean(x, som.get_weights()[som.winner(x)]) for x in mslp_data_normalized])
+topo_error = np.mean([
+    1 if np.linalg.norm(np.array(som.winner(x)) - np.array(som.winner(y))) > 1 else 0
+    for x, y in zip(mslp_data_normalized[:-1], mslp_data_normalized[1:])
+])
+print(f'MSLP Quantization Error: {q_error:.4f}')
+print(f'MSLP Topographic Error: {topo_error:.4f}')
+
+# Map samples to nodes and count frequencies
+mapped_nodes = np.array([som.winner(x) for x in mslp_data_normalized])
+node_counts = np.zeros((som_x, som_y))
+for node in mapped_nodes:
+    node_counts[node[0], node[1]] += 1
+
+# Calculate node frequencies
+total_samples = len(mslp_data_normalized)
+node_frequencies = (node_counts / total_samples) * 100
+
+        
+        # Longitude (X) labels: Only on the bottom row
+        gl.top_labels = False 
+        gl.bottom_labels = (i == som_x - 1) 
+
+        # Latitude (Y) labels: Only on the left column
+        gl.left_labels = (j == 0)
+        gl.right_labels = False 
+
+        # Style the labels
+        gl.xlabel_style = {'fontsize': 12}
+        gl.ylabel_style = {'fontsize': 12}
+        # ax.set_xticks([])
+        # ax.set_yticks([])
+
+# Add a common colorbar for the MSLP plots
+mslp_bbox = gs_overall[0, 0].get_position(fig)
+cbar_ax_mslp = fig.add_axes([mslp_bbox.x0 + mslp_bbox.width + 0.01, mslp_bbox.y0, 0.015, mslp_bbox.height])
+cbar_mslp = fig.colorbar(cs_mslp, cax=cbar_ax_mslp, orientation="vertical",
+                          ticks=mslp_line_levels)
+cbar_mslp.set_label("Mean Sea Level Pressure (hPa)", fontsize=14) # Corrected label from [m] to [hPa] as per MSLP data
+cbar_mslp.ax.tick_params(labelsize=14)
+# Add label for the MSLP plot
+fig.text(mslp_bbox.x0 + mslp_bbox.width / 2, 0.92, '(a)',
+          fontsize=16, ha='center', va='top')
+
+
+# --- Prepare data for Heatmap (MSLP specific, NO WIND) ---
+# Convert time index
+times = pd.to_datetime(mslp['valid_time'].values) # Use mslp valid_time
+assert len(times) == len(mapped_nodes)
+
+# Map months to Southern Hemisphere seasons
+def get_season(month):
+    if month in [12, 1, 2]:
+        return "Summer (DJF)"
+    elif month in [3, 4, 5]:
+        return "Autumn (MAM)"
+    elif month in [6, 7, 8]:
+        return "Winter (JJA)"
+    elif month in [9, 10, 11]:
+        return "Spring (SON)"
+
+seasons = [get_season(t.month) for t in times]
+
+# For MSLP, we are NOT filtering based on wind in a box.
+# Every mapped node contributes to the seasonal frequency of MSLP patterns.
+# So, no 'in_box_flags' are needed.
+
+# Build DataFrame
+df_heat = pd.DataFrame({
+    'time': times,
+    'season': seasons,
+    'node': [i * som_y + j + 1 for i, j in mapped_nodes],
+})
+
+# Group and compute seasonal node frequencies
+pivot_table = df_heat.pivot_table(index='node', columns='season', aggfunc='size', fill_value=0)
+
+# --- ADDED CODE START (Calculates raw counts and formats annotation strings) ---
+# 1. Calculate the raw count matrix (number of days)
+pivot_table_days = pivot_table.copy() # Pivot table currently holds raw counts
+pivot_table_days = pivot_table_days.sort_index(ascending=False).reindex(columns=season_order)
+
+# 2. Normalize to percentage per season (This is your original step)
+pivot_table = pivot_table.divide(pivot_table.sum(axis=0), axis=1) * 100
+
+# 3. Sort nodes numerically and flip so Node 1 is at bottom (Your original step)
+pivot_table = pivot_table.sort_index(ascending=False)
+
+# 4. Rename columns with seasonal order (Your original step)
+season_order = ['Summer (DJF)', 'Autumn (MAM)', 'Winter (JJA)', 'Spring (SON)']
+pivot_table = pivot_table.reindex(columns=season_order)
+
+# 5. Create a custom annotation matrix
+annot_labels = np.asarray([f"{pct:.1f}%\n(n={int(day)})" 
+                           for pct, day in zip(pivot_table.values.flatten(), 
+                                               pivot_table_days.values.flatten())]).reshape(pivot_table.shape)
+
+# Rename index to just numbers (1, 2, ...) (Your original step)
+pivot_table.index = [str(i) for i in pivot_table.index]
+
+# GridSpec for the Heatmap (right column)
+ax_heatmap = fig.add_subplot(gs_overall[0, 1])
+# --- END OF ADDED CODE ---
+
+    ax_heatmap.text(0.5, 0.5, "No MSLP SOM nodes to display for heatmap.",
+                     horizontalalignment='center', verticalalignment='center', transform=ax_heatmap.transAxes, fontsize=12)
+    ax_heatmap.set_xticks([])
+    ax_heatmap.set_yticks([])
+    ax_heatmap.set_frame_on(False) # Hide axes frame if no heatmap is drawn
+
+# Add label for the heatmap
+heatmap_bbox = gs_overall[0, 1].get_position(fig)
+fig.text(heatmap_bbox.x0 + heatmap_bbox.width / 2, 0.92, '(b)', fontsize=16, ha='center', va='top')
+
+# Use tight_layout only on the overall GridSpec to respect its spacing
+fig.tight_layout(rect=[0, 0, 1, 0.95]) # Adjust rect to prevent title overlap, applied to whole figure
+plt.savefig('MSLP_SOM_seasonal_Count_Fixed.png', dpi=300, bbox_inches='tight', format='png')
+
+plt.show() # You can still call plt.show() if you want to see it in Colab too.
+
 
